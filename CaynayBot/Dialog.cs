@@ -1,11 +1,12 @@
-﻿using RandomMatch.Server.Data;
-using RandomMatch.Server.Models;
+﻿using CaynayBot.Services;
+using CaynayBot.Data;
+using CaynayBot.Models;
 using System.Text;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.ReplyMarkups;
 
-namespace RandomMatch.Server.Services;
+namespace CaynayBot;
 
 internal class Dialog
 {
@@ -192,29 +193,39 @@ internal class Dialog
                         {
                             var products = await productService.GetAllAsync();
                             var reports = await reportService.GetAllAsync();
-                            var sum = 0.0m;
-                            var msg = "";
-                            var csvReport = "";
-                            var counter = 0;
-                            reports.OrderBy(x => x.CreatedAt).ToList().ForEach(rep =>
+
+
+                            if (reports.Count() > 0 && products.Count() > 0)
                             {
-                                var product = products.FirstOrDefault(p => p.Id == rep.ProductId);
-                                if (product != null)
+                                var sum = 0.0m;
+                                var msg = "";
+                                var csvReport = "";
+                                var counter = 0;
+                                reports.OrderBy(x => x.CreatedAt).ToList().ForEach(rep =>
                                 {
-                                    counter++;
-                                    msg += $"{rep.CreatedAt:g} - {product.Name}, {rep.Count}, {product.Price:0.00}\n";
-                                    csvReport += $"{rep.CreatedAt:g}, {product.Name}, {product.Price:0.00}, {rep.Count}, {rep.CreatorChatId}\n";
-                                    sum += product.Price * rep.Count;
-                                
+                                    var product = products.FirstOrDefault(p => p.Id == rep.ProductId);
+                                    if (product != null)
+                                    {
+                                        counter++;
+                                        msg += $"{rep.CreatedAt:g} - {product.Name}, {rep.Count}, {product.Price:0.00}\n";
+                                        csvReport += $"{rep.CreatedAt:g}, {product.Name}, {product.Price:0.00}, {rep.Count}, {rep.CreatorChatId}\n";
+                                        sum += product.Price * rep.Count;
+
+                                    }
+                                });
+                                msg += $"\nИтог:\n- Кол-во продаж: {counter}\n- Сумма продаж: {sum:0.00} р.";
+                                using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(csvReport)))
+                                {
+                                    var file = new InputFileStream(stream, $"report-{DateTime.Now:yyyy-MM-ddTHH-mm-ss}.csv");
+                                    await bot.SendMessage(chatId, msg);
+                                    await bot.SendDocument(chatId, file);
                                 }
-                            }); 
-                            msg += $"\nИтог:\n- Кол-во продаж: {counter}\n- Сумма продаж: {sum:0.00} р.";
-                            using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(csvReport)))
-                            {
-                                var file = new InputFileStream(stream, $"report-{DateTime.Now:yyyy-MM-ddTHH-mm-ss}.csv");
-                                await bot.SendMessage(chatId, msg);
-                                await bot.SendDocument(chatId, file);
                             }
+                            else
+                            {
+                                await bot.SendMessage(chatId, "Продажи отсутствуют");
+                            }
+                            
                         }
                         if (message == "/reset")
                         {

@@ -1,80 +1,42 @@
-﻿using Microsoft.EntityFrameworkCore;
-using RandomMatch.Server.Data;
-using RandomMatch.Server.Models;
+﻿using CaynayBot.Data;
+using CaynayBot.Models;
+using CaynayBot.Repositories;
+using CaynayBot.Services;
+using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
-using Telegram.Bot.Types.Enums;
 
-namespace RandomMatch.Server.Services;
+namespace CaynayBot;
 
-public class TelegramBotUpdateHandler : BackgroundService
+public class TelegramBotUpdateHandler
 {
     public static bool _startUp = false;
-
-
     private readonly ITelegramBotClient _botClient;
-    private readonly IServiceScopeFactory _serviceScopeFactory;
-    private readonly ILogger<TelegramBotUpdateHandler> _logger;
-    private readonly IHostApplicationLifetime _hostApplicationLifetime;
+    private readonly TLogger _logger;
     private CancellationToken _stoppingToken;
-    
-    public TelegramBotUpdateHandler(
-        ITelegramBotClient botClient,
-        IServiceScopeFactory serviceScopeFactory,
-        ILogger<TelegramBotUpdateHandler> logger)
+
+   
+    public TelegramBotUpdateHandler(string token, TLogger logger)
     {
-        _botClient = botClient;
-        _serviceScopeFactory = serviceScopeFactory;
+        _botClient = new TelegramBotClient(token);
         _logger = logger;
-        //_hostApplicationLifetime = hostApplicationLifetime;
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    public void Start()
     {
-        _stoppingToken = stoppingToken;
-        _logger.LogInformation("Запуск обработчика Telegram-бота...");
-
-        // Проверяем подключение к Telegram API
-        try
-        {
-            var me = await _botClient.GetMe(stoppingToken);
-            _logger.LogInformation("Бот @{Username} запущен.", me.Username);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Не удалось подключиться к Telegram API");
-            //_hostApplicationLifetime.StopApplication();
-            return;
-        }
-
+        var cts = new CancellationTokenSource();
+        var cancellationToken = cts.Token;
         var receiverOptions = new ReceiverOptions
         {
-            AllowedUpdates = Array.Empty<UpdateType>()
+            AllowedUpdates = { },
         };
 
-        try
-        {
-            _botClient.StartReceiving(
-                HandleUpdateAsync,
-                HandleErrorAsync,
-                receiverOptions,
-                cancellationToken: stoppingToken
-            );
+        _botClient.StartReceiving(
+            (botClient, update, cancellationToken1) => HandleUpdateAsync(botClient, update, cancellationToken1),
+            HandleErrorAsync, receiverOptions, cancellationToken);
 
-            // Ждем, пока не будет запрошена остановка
-            await Task.Delay(Timeout.Infinite, stoppingToken);
-        }
-        catch (OperationCanceledException)
-        {
-            _logger.LogInformation("Остановка обработчика Telegram-бота");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Критическая ошибка в обработчике Telegram-бота");
-            throw;
-        }
     }
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
@@ -87,89 +49,91 @@ public class TelegramBotUpdateHandler : BackgroundService
             return;
         }
 
-        // Используем отдельный scope для каждого обновления
-        // Scope будет создан и корректно уничтожен после обработки сообщения
-        using (var scope = _serviceScopeFactory.CreateScope())
+        var connectionString = "server=127.0.0.1;uid=root;pwd=asde1D#cEC;database=randommatch;";
+
+        var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();
+        optionsBuilder.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString));
+
+        
+
+        try
         {
-            var userService = scope.ServiceProvider.GetRequiredService<IUserService>();
-            var productService = scope.ServiceProvider.GetRequiredService<IProductService>();
-            var reportService = scope.ServiceProvider.GetRequiredService<IReportService>();
-            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            using var dbContext = new AppDbContext(optionsBuilder.Options);
+            var userService = new UserService(new Repository<TUser>(dbContext));
+            var productService = new ProductService(new Repository<Product>(dbContext));
+            var reportService = new ReportService(new Repository<Report>(dbContext));
 
-            try
+            var from = update.Message?.From ?? update.CallbackQuery?.From;
+            var message = update.Message?.Text ?? "";
+            var data = update.CallbackQuery?.Data;
+
+            // Проверяем подключение к БД перед работой
+            if (!await IsDatabaseAvailable(dbContext, cancellationToken))
             {
-                var from = update.Message?.From ?? update.CallbackQuery?.From;
-                var message = update.Message?.Text ?? "";
-                var data = update.CallbackQuery?.Data;
-
-                // Проверяем подключение к БД перед работой
-                if (!await IsDatabaseAvailable(dbContext, cancellationToken))
-                {
-                    await SendErrorMessage(botClient,
-                        "Сервис временно недоступен. Пожалуйста, попробуйте позже.");
-                    return;
-                }
-
-                // Получаем или создаем пользователя в отдельном подключении
-                var user = await GetUserWithRetry(userService, from.Id, from.Username, from.FirstName, from.LastName, cancellationToken);
-
-                if (user == null)
-                {
-                    await SendErrorMessage(botClient,
-                        "Произошла ошибка при загрузке данных пользователя.");
-                    return;
-                }
-
-                // Обрабатываем callback query
-                if (data != null)
-                {
-                    await Dialog.CallMessage(
-                        botClient,
-                        userService,
-                        productService,
-                        reportService,
-                        user,
-                        data,
-                        update.Message?.Photo,
-                        update.CallbackQuery?.Message?.Id);
-                }
-                // Обрабатываем текстовое сообщение
-                else if (user != null)
-                {
-                    await Dialog.TextMessage(
-                        botClient,
-                        dbContext,
-                        userService,
-                        productService,
-                        reportService,
-                        user,
-                        message,
-                        update.Message?.Photo);
-                }
-
-                // Сохраняем изменения пользователя с retry
-                await UpdateUserWithRetry(userService, user, cancellationToken);
-            }
-            catch (DbUpdateException dbEx)
-            {
-                _logger.LogError(dbEx, "Ошибка базы данных при обработке сообщения от {UserId}");
                 await SendErrorMessage(botClient,
-                    "⚠️ Ошибка базы данных. Пожалуйста, повторите действие позже.");
+                    "Сервис временно недоступен. Пожалуйста, попробуйте позже.");
+                return;
             }
-            catch (OperationCanceledException)
-            {
-                _logger.LogWarning("Операция отменена при обработке сообщения");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Ошибка при обработке сообщения от Telegram для пользователя {UserId}");
 
-                // Не отправляем сообщение об ошибке, если это callback query (может вызвать повторные попытки)
-                if (update.Message != null)
-                {
-                    await SendErrorMessage(botClient,
-                        "❌ Произошла ошибка. Пожалуйста, попробуйте еще раз.");
-                }
+            // Получаем или создаем пользователя в отдельном подключении
+            var user = await GetUserWithRetry(userService, from.Id, from.Username, from.FirstName, from.LastName, cancellationToken);
+
+            if (user == null)
+            {
+                await SendErrorMessage(botClient,
+                    "Произошла ошибка при загрузке данных пользователя.");
+                return;
+            }
+
+            // Обрабатываем callback query
+            if (data != null)
+            {
+                await Dialog.CallMessage(
+                    botClient,
+                    userService,
+                    productService,
+                    reportService,
+                    user,
+                    data,
+                    update.Message?.Photo,
+                    update.CallbackQuery?.Message?.Id);
+            }
+            // Обрабатываем текстовое сообщение
+            else if (user != null)
+            {
+                await Dialog.TextMessage(
+                    botClient,
+                    dbContext,
+                    userService,
+                    productService,
+                    reportService,
+                    user,
+                    message,
+                    update.Message?.Photo);
+            }
+
+            // Сохраняем изменения пользователя с retry
+            await UpdateUserWithRetry(userService, user, cancellationToken);
+        }
+        catch (DbUpdateException dbEx)
+        {
+            _logger.LogError(dbEx, "Ошибка базы данных при обработке сообщения от {UserId}");
+            await SendErrorMessage(botClient,
+                "⚠️ Ошибка базы данных. Пожалуйста, повторите действие позже.");
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("Операция отменена при обработке сообщения");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ошибка при обработке сообщения от Telegram для пользователя {UserId}");
+
+            // Не отправляем сообщение об ошибке, если это callback query (может вызвать повторные попытки)
+            if (update.Message != null)
+            {
+                await SendErrorMessage(botClient,
+                    "❌ Произошла ошибка. Пожалуйста, попробуйте еще раз.");
             }
         }
     }
