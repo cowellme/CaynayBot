@@ -101,6 +101,7 @@ public class TelegramBotUpdateHandler
             // Обрабатываем текстовое сообщение
             else if (user != null)
             {
+                Console.WriteLine(message);
                 await Dialog.TextMessage(
                     botClient,
                     dbContext,
